@@ -2,22 +2,12 @@ FROM node:22-alpine
 
 WORKDIR /app
 
-# Copy packages first for caching
-COPY backend/package*.json ./backend/
-COPY database/package*.json ./database/
-COPY package*.json ./
+COPY backend/package*.json ./
 
-# Install dependencies
-RUN npm run install:all
+RUN npm install --production
 
-# Copy sources
-COPY shared/ ./shared/
-COPY database/ ./database/
-COPY backend/ ./backend/
-
-# Generate Prisma Client
-RUN npm run db:generate
+COPY backend/ ./
 
 EXPOSE 5000
 
-CMD ["npm", "run", "start:backend"]
+CMD ["node", "server.js"]

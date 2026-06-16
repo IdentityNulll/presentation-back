@@ -11,13 +11,20 @@ const PresentationSchema = new mongoose.Schema({
   },
   style: {
     type: String,
-    enum: ['Modern', 'Professional', 'Academic', 'Startup Pitch', 'Minimalist', 'Dark Theme', 'Creative', 'Corporate'],
     default: 'Professional'
   },
   audience: {
     type: String,
-    enum: ['Students', 'Teachers', 'Business', 'Investors', 'General'],
     default: 'General'
+  },
+  paymentStatus: {
+    type: String,
+    enum: ['PENDING_PAYMENT', 'SUBMITTED', 'APPROVED', 'REJECTED'],
+    default: 'PENDING_PAYMENT'
+  },
+  paymentReceipt: {
+    type: String,
+    default: null
   },
   theme: {
     name: { type: String, default: 'default' },

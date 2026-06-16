@@ -1,7 +1,7 @@
 const { Presentation, Slide, User, Template, Export, Setting, logSystemEvent } = require('../services/dbService');
 const { generatePresentationStructure, regenerateSingleSlide } = require('../services/aiService');
 const { generatePPTX, generatePDF } = require('../services/exportService');
-const { THEMES } = require('../../shared/themes');
+const { THEMES } = require('../shared/themes');
 const logger = require('../utils/logger');
 const cloudinary = require('cloudinary').v2;
 
@@ -59,9 +59,11 @@ async function generatePresentation(req, res, next) {
   const { title, audience, style, topic } = req.body;
   const userId = req.user._id;
 
-  if (!title || !audience || !style || !topic) {
-    return res.status(400).json({ error: 'title, audience, style, and topic are required.' });
+  if (!title || !audience || !topic) {
+    return res.status(400).json({ error: 'title, audience, and topic are required.' });
   }
+
+  const resolvedStyle = style || 'professional';
 
   try {
     // Check limits for FREE users
@@ -72,11 +74,12 @@ async function generatePresentation(req, res, next) {
       }
     }
 
-    // Call AI service
-    const generated = await generatePresentationStructure(topic, title, audience, style, 6, 'en', userId);
+    // Call AI service with user language preference and 9 slides
+    const userLanguage = req.user.language || 'en';
+    const generated = await generatePresentationStructure(topic, title, audience, resolvedStyle, 9, userLanguage, userId);
 
     // Save Presentation
-    const themeConfig = THEMES[style.toLowerCase()] || THEMES.professional;
+    const themeConfig = THEMES[resolvedStyle.toLowerCase()] || THEMES.professional;
     const presentation = await Presentation.create({
       title: generated.title,
       topic: generated.topic,
@@ -84,8 +87,9 @@ async function generatePresentation(req, res, next) {
       audience: generated.audience,
       slideCount: generated.slides.length,
       userId,
+      paymentStatus: 'PENDING_PAYMENT',
       theme: {
-        name: style,
+        name: resolvedStyle,
         bg: themeConfig.bg,
         text: themeConfig.text,
         accent: themeConfig.accent,
@@ -111,6 +115,74 @@ async function generatePresentation(req, res, next) {
     const slides = await Slide.insertMany(slidesData);
 
     await logSystemEvent('ai_generation', { topic, title, presentationId: presentation._id }, userId);
+
+    // Notify user via Telegram Bot with inline buttons
+    try {
+      const { getBotInstance } = require('../services/botService');
+      const bot = getBotInstance();
+      if (bot) {
+        const { Markup } = require('telegraf');
+        const i18n = require('../utils/i18n');
+        const MINI_APP_URL = (process.env.MINI_APP_URL || 'http://localhost:5173').replace(/\/+$/, '');
+        
+        // Build editor URL
+        const editUrl = `${MINI_APP_URL}/?tgId=${req.user.telegramId}&presId=${presentation._id}&action=edit`;
+        
+        const isPubliclyAccessible = (url) => {
+          try {
+            const { protocol, hostname } = new URL(url);
+            if (protocol !== 'http:' && protocol !== 'https:') return false;
+            if (['localhost', '127.0.0.1', '0.0.0.0', '::1'].includes(hostname)) return false;
+            if (hostname.endsWith('.local')) return false;
+            if (/^10\.|^192\.168\.|^172\.(1[6-9]|2\d|3[01])\./.test(hostname)) return false;
+            return true;
+          } catch {
+            return false;
+          }
+        };
+
+        let editButton = null;
+        if (isPubliclyAccessible(editUrl)) {
+          if (editUrl.startsWith('https://')) {
+            editButton = Markup.button.webApp(i18n.getTranslation(userLanguage, 'btn_open_editor'), editUrl);
+          } else {
+            editButton = Markup.button.url(i18n.getTranslation(userLanguage, 'btn_open_editor'), editUrl);
+          }
+        }
+
+        const lockStatus = presentation.paymentStatus === 'APPROVED' ? '✅ Unlocked' : '🔒 Locked (Awaiting Payment)';
+        const text = `🎉 *Presentation Created successfully!* 🎉\n\n`
+          + `📊 *${presentation.title}* (9 slides)\n`
+          + `• Audience: ${presentation.audience}\n`
+          + `• Style: ${presentation.style}\n`
+          + `• Status: ${lockStatus}\n\n`
+          + `🔗 Editor: ${editUrl}`;
+
+        const buttonRows = [];
+        if (editButton) {
+          buttonRows.push([editButton]);
+        }
+        
+        buttonRows.push([
+          Markup.button.callback(i18n.getTranslation(userLanguage, 'btn_download_pptx'), `dl_pptx_${presentation._id}`),
+          Markup.button.callback(i18n.getTranslation(userLanguage, 'btn_download_pdf'), `dl_pdf_${presentation._id}`)
+        ]);
+
+        const buildKeyboard = (rows) => {
+          const filtered = rows
+            .map(row => row.filter(Boolean))
+            .filter(row => row.length > 0);
+          return filtered.length ? Markup.inlineKeyboard(filtered) : {};
+        };
+
+        await bot.telegram.sendMessage(req.user.telegramId, text, {
+          parse_mode: 'Markdown',
+          ...buildKeyboard(buttonRows)
+        });
+      }
+    } catch (botErr) {
+      logger.error('Failed to send bot notification for generated presentation: %O', botErr);
+    }
 
     return res.status(201).json({
       presentation,
@@ -161,6 +233,11 @@ async function updatePresentation(req, res, next) {
     const pres = await Presentation.findById(id);
     if (!pres) return res.status(404).json({ error: 'Presentation not found.' });
 
+    // Enforce lock checks
+    if (pres.paymentStatus !== 'APPROVED') {
+      return res.status(403).json({ error: 'LOCK_ERROR', message: '🔒 This presentation is locked. Please complete the payment first.' });
+    }
+
     if (title) pres.title = title;
     if (style) pres.style = style;
     if (theme) pres.theme = { ...pres.theme, ...theme };
@@ -178,6 +255,14 @@ async function updatePresentation(req, res, next) {
 async function addSlide(req, res, next) {
   const { id } = req.params;
   try {
+    const pres = await Presentation.findById(id);
+    if (!pres) return res.status(404).json({ error: 'Presentation not found.' });
+
+    // Enforce lock checks
+    if (pres.paymentStatus !== 'APPROVED') {
+      return res.status(403).json({ error: 'LOCK_ERROR', message: '🔒 This presentation is locked. Please complete the payment first.' });
+    }
+
     const slideCount = await Slide.countDocuments({ presentationId: id });
     const slide = await Slide.create({
       presentationId: id,
@@ -206,6 +291,11 @@ async function updateSlide(req, res, next) {
     const slide = await Slide.findById(slideId);
     if (!slide) return res.status(404).json({ error: 'Slide not found.' });
 
+    const pres = await Presentation.findById(slide.presentationId);
+    if (pres && pres.paymentStatus !== 'APPROVED') {
+      return res.status(403).json({ error: 'LOCK_ERROR', message: '🔒 This presentation is locked. Please complete the payment first.' });
+    }
+
     if (title !== undefined) slide.title = title;
     if (type !== undefined) slide.type = type;
     if (description !== undefined) slide.description = description;
@@ -228,6 +318,11 @@ async function updateSlide(req, res, next) {
 async function deleteSlide(req, res, next) {
   const { id, slideId } = req.params;
   try {
+    const pres = await Presentation.findById(id);
+    if (pres && pres.paymentStatus !== 'APPROVED') {
+      return res.status(403).json({ error: 'LOCK_ERROR', message: '🔒 This presentation is locked. Please complete the payment first.' });
+    }
+
     const slideToDelete = await Slide.findById(slideId);
     if (!slideToDelete) return res.status(404).json({ error: 'Slide not found.' });
 
@@ -253,6 +348,11 @@ async function deleteSlide(req, res, next) {
 async function duplicateSlide(req, res, next) {
   const { id, slideId } = req.params;
   try {
+    const pres = await Presentation.findById(id);
+    if (pres && pres.paymentStatus !== 'APPROVED') {
+      return res.status(403).json({ error: 'LOCK_ERROR', message: '🔒 This presentation is locked. Please complete the payment first.' });
+    }
+
     const slideToDup = await Slide.findById(slideId);
     if (!slideToDup) return res.status(404).json({ error: 'Slide not found.' });
 
@@ -297,6 +397,11 @@ async function reorderSlides(req, res, next) {
   }
 
   try {
+    const pres = await Presentation.findById(id);
+    if (pres && pres.paymentStatus !== 'APPROVED') {
+      return res.status(403).json({ error: 'LOCK_ERROR', message: '🔒 This presentation is locked. Please complete the payment first.' });
+    }
+
     const bulkOps = slideIds.map((slideId, index) => ({
       updateOne: {
         filter: { _id: slideId, presentationId: id },
@@ -320,6 +425,10 @@ async function regenerateSlide(req, res, next) {
   try {
     const pres = await Presentation.findById(id);
     if (!pres) return res.status(404).json({ error: 'Presentation not found.' });
+
+    if (pres.paymentStatus !== 'APPROVED') {
+      return res.status(403).json({ error: 'LOCK_ERROR', message: '🔒 This presentation is locked. Please complete the payment first.' });
+    }
 
     const slide = await Slide.findById(slideId);
     if (!slide) return res.status(404).json({ error: 'Slide not found.' });
@@ -496,6 +605,11 @@ async function exportPresentation(req, res, next) {
     const pres = await Presentation.findById(id);
     if (!pres) return res.status(404).json({ error: 'Presentation not found.' });
 
+    // Enforce lock checks
+    if (pres.paymentStatus !== 'APPROVED') {
+      return res.status(403).json({ error: 'LOCK_ERROR', message: '🔒 This presentation is locked. Please complete the payment first.' });
+    }
+
     const slides = await Slide.find({ presentationId: id }).sort({ order: 1 });
     if (slides.length === 0) {
       return res.status(400).json({ error: 'Presentation has no slides to export.' });
@@ -534,6 +648,54 @@ async function exportPresentation(req, res, next) {
   }
 }
 
+/**
+ * Handles style confirmation and initiates Telegram payment request
+ */
+async function selectStyle(req, res, next) {
+  const { id } = req.params;
+  const { style } = req.body;
+
+  if (!style) {
+    return res.status(400).json({ error: 'style is required.' });
+  }
+
+  try {
+    const pres = await Presentation.findById(id);
+    if (!pres) return res.status(404).json({ error: 'Presentation not found.' });
+
+    pres.style = style;
+    const themeConfig = THEMES[style.toLowerCase()] || THEMES.professional;
+    pres.theme = {
+      name: style,
+      bg: themeConfig.bg,
+      text: themeConfig.text,
+      accent: themeConfig.accent,
+      fontTitle: themeConfig.fontTitle,
+      fontBody: themeConfig.fontBody
+    };
+    pres.paymentStatus = 'PENDING_PAYMENT';
+    await pres.save();
+
+    // Trigger bot message
+    try {
+      const { getBotInstance } = require('../services/botService');
+      const bot = getBotInstance();
+      if (bot) {
+        const i18n = require('../utils/i18n');
+        const userLanguage = req.user.language || 'en';
+        const paymentMsg = i18n.getTranslation(userLanguage, 'payment_request');
+        await bot.telegram.sendMessage(req.user.telegramId, paymentMsg, { parse_mode: 'Markdown' });
+      }
+    } catch (botErr) {
+      logger.error('Failed to send bot payment message: %O', botErr);
+    }
+
+    return res.json({ message: 'Style selected and payment request sent.', presentation: pres });
+  } catch (error) {
+    next(error);
+  }
+}
+
 module.exports = {
   getTemplates,
   generatePresentation,
@@ -548,5 +710,6 @@ module.exports = {
   regenerateSlide,
   suggestImages,
   uploadImage,
-  exportPresentation
+  exportPresentation,
+  selectStyle
 };
